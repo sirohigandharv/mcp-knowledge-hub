@@ -1,0 +1,10 @@
+{
+  "mode": "sse",
+  "env": {
+    "MCP_SERVER_URL": "http://localhost:8080/sse",
+    "SERVICENOW_INSTANCE_URL": "https://epamsvsdemo4.service-now.com",
+    "SERVICENOW_USERNAME": "eliteademouser",
+    "SERVICENOW_PASSWORD": "Epam$4321",
+    "SERVICENOW_AUTH_TYPE": "basic"
+  }
+}

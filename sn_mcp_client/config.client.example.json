@@ -1,0 +1,14 @@
+{
+  "command": "C:/Users/your_user/servicenow-mcp/.venv/Scripts/python.exe",
+  "args": [
+    "-m",
+    "servicenow_mcp.cli"
+  ],
+  "env": {
+    "SERVICENOW_INSTANCE_URL": "https://your-instance.service-now.com",
+    "SERVICENOW_USERNAME": "your_username",
+    "SERVICENOW_PASSWORD": "your_password",
+    "SERVICENOW_AUTH_TYPE": "basic",
+    "MCP_TOOL_PACKAG": "knowledge_author"
+  }
+}

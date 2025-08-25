@@ -1,0 +1,8 @@
+mcp
+fastapi
+uvicorn
+reportlab
+bs4
+faiss-cpu
+sentence-transformers
+PyPDF2

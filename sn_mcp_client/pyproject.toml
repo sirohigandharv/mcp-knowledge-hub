@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=67", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sn-mcp-client"
+version = "0.1.0"
+description = "Python MCP client to talk to a ServiceNow MCP server over stdio"
+authors = [{name="Your Name"}]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "model-context-protocol",
+]
+
+[project.scripts]
+sn-mcp = "sn_mcp_client.cli:main"
