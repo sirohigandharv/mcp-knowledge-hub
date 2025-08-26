@@ -45,14 +45,16 @@ class MCPConfig:
 @asynccontextmanager
 async def session_from_config(cfg: MCPConfig):
     """Start the MCP server via stdio or connect via SSE based on config."""
-    # Ensure environment variables are set
+    # Ensure environment variables are set, but do not overwrite Docker's
     if cfg.env:
-        os.environ.update(cfg.env)
+        for k, v in cfg.env.items():
+            os.environ.setdefault(k, v)
 
     if cfg.mode == "sse":
         if not HAS_SSE:
             raise RuntimeError("SSE mode requested but `mcp.client.sse` not available.")
-        mcp_url = cfg.env.get("MCP_SERVER_URL", "http://localhost:8080")
+        #mcp_url = cfg.env.get("MCP_SERVER_URL", "http://localhost:8080")
+        mcp_url = os.getenv("MCP_SERVER_URL", cfg.env.get("MCP_SERVER_URL", "http://localhost:8080"))
         print(f"Connecting to MCP Server via SSE at {mcp_url}")
         async with sse_client(mcp_url) as (read, write):
             async with ClientSession(read, write) as session:

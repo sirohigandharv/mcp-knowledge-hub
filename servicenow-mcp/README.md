@@ -40,9 +40,14 @@ This project implements an MCP server that enables Claude to connect to ServiceN
 
 2. Create a virtual environment and install the package:
    ```
-   python -m venv .venv
+   python -m venv .venv 
    source .venv/bin/activate  # On Windows: .venv\Scripts\activate
    pip install -e .
+
+   # conda commmands
+   - conda create --name myenv python=3.13
+   - conda activate myenv
+   - pip install -e .
    ```
 
 3. Create a `.env` file with your ServiceNow credentials:
@@ -85,6 +90,9 @@ By default, the server will listen on `0.0.0.0:8080`. You can customize the host
 
 ```
 servicenow-mcp-sse --host=127.0.0.1 --port=8000
+
+## I use the following : - servicenow-mcp-sse --host=0.0.0.0 --port=8080
+
 ```
 
 #### Connecting to the SSE Server

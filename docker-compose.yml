@@ -1,0 +1,26 @@
+version: "3.9"
+
+services:
+  mcp-server:
+    build:
+      context: ./servicenow-mcp
+    container_name: mcp-server
+    ports:
+      - "8080:8080"
+    environment:
+      - SERVICENOW_INSTANCE_URL=https://epamsvsdemo4.service-now.com
+      - SERVICENOW_USERNAME=eliteademouser
+      - SERVICENOW_PASSWORD=Epam$4321
+      - SERVICENOW_AUTH_TYPE=basic
+      - MCP_TOOL_PACKAGE=knowledge_author
+
+  mcp-client:
+    build:
+      context: ./sn_mcp_client
+    container_name: mcp-client
+    ports:
+      - "8000:8000"
+    environment:
+      - MCP_SERVER_URL=http://mcp-server:8080/sse
+    depends_on:
+      - mcp-server

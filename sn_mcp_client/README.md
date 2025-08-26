@@ -21,8 +21,10 @@ A minimal **Python MCP client** that connects (via stdio) to your **ServiceNow M
 ```bash
 # from project root
 python -m venv .venv
+conda create --name sn_mcp_client python=3.13
 # Windows:
 .venv\Scripts\activate
+conda activate sn_mcp_client
 # macOS/Linux:
 # source .venv/bin/activate
 
