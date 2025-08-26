@@ -50,6 +50,22 @@ if STORAGE_MODE == "cloud":
 INDEX_PATH = os.path.join(UPLOAD_DIR, "vector_index.faiss")
 METADATA_PATH = os.path.join(UPLOAD_DIR, "vector_metadata.pkl")
 
+# NEW: If cloud mode, override index/metadata to bucket paths
+if STORAGE_MODE == "cloud":
+    INDEX_BLOB = "uploads/vector_index.faiss"
+    METADATA_BLOB = "uploads/vector_metadata.pkl"
+
+    # Download existing index and metadata if present
+    if bucket.blob(INDEX_BLOB).exists():
+        tmp_index = "/tmp/vector_index.faiss"
+        bucket.blob(INDEX_BLOB).download_to_filename(tmp_index)
+        INDEX_PATH = tmp_index
+
+    if bucket.blob(METADATA_BLOB).exists():
+        tmp_meta = "/tmp/vector_metadata.pkl"
+        bucket.blob(METADATA_BLOB).download_to_filename(tmp_meta)
+        METADATA_PATH = tmp_meta
+
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 embedding_dimension = 384
 
@@ -396,10 +412,16 @@ async def upload_files_from_downloads():
         faiss_index.add(concat_embeddings)
         metadata_store.extend(new_metadata)
 
-        # Persist
+        # Persist locally
         faiss.write_index(faiss_index, INDEX_PATH)
         with open(METADATA_PATH, "wb") as f:
             pickle.dump(metadata_store, f)
+
+        # NEW: Upload to bucket if in cloud mode
+        if STORAGE_MODE == "cloud":
+            bucket.blob(INDEX_BLOB).upload_from_filename(INDEX_PATH)
+            bucket.blob(METADATA_BLOB).upload_from_filename(METADATA_PATH)
+
 
     return JSONResponse(content={
         "success": True,
