@@ -1,6 +1,5 @@
-from fastapi import FastAPI, Query, BackgroundTasks, UploadFile, File, Query
-from fastapi.testclient import TestClient  # For internal API call
-from typing import Optional
+from fastapi import FastAPI, Query, BackgroundTasks
+from typing import Optional, Any, Dict, List
 import asyncio
 import json
 import re
@@ -15,74 +14,134 @@ import faiss
 import pickle
 import numpy as np
 from PyPDF2 import PdfReader
+import random
+import time
 
-# Path to your existing config
+# ----------------------------
+# Config & Globals
+# ----------------------------
+
 CONFIG_PATH = "config.client.ssc.json"
-
-# Load configuration once
 cfg = MCPConfig.load(CONFIG_PATH)
 
-
-# Directories
-DOWNLOAD_DIR = "downloads"  # Source folder with PDF files
-UPLOAD_DIR = "uploads"      # Destination folder for processed outputs
+DOWNLOAD_DIR = "downloads"
+UPLOAD_DIR = "uploads"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# FAISS & metadata storage paths (inside uploads folder)
 INDEX_PATH = os.path.join(UPLOAD_DIR, "vector_index.faiss")
 METADATA_PATH = os.path.join(UPLOAD_DIR, "vector_metadata.pkl")
 
-# Load embedding model
 embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
-embedding_dimension = 384  # for all-MiniLM-L6-v2
+embedding_dimension = 384
 
-# Initialize FAISS index
 if os.path.exists(INDEX_PATH):
     faiss_index = faiss.read_index(INDEX_PATH)
 else:
     faiss_index = faiss.IndexFlatL2(embedding_dimension)
 
-# Load metadata if exists
 if os.path.exists(METADATA_PATH):
     with open(METADATA_PATH, "rb") as f:
         metadata_store = pickle.load(f)
 else:
-    metadata_store = []  # List of dicts: [{filename, chunk_text}, ...]
+    metadata_store = []
 
+# Simple progress tracker in-memory
+progress = {
+    "running": False,
+    "kb_total": 0,
+    "kb_done": 0,
+    "article_total": 0,
+    "article_done": 0,
+    "errors": 0,
+    "last_error": None,
+}
+
+ # Simple counter for unique filenames
+file_counter = 0
 
 app = FastAPI(title="ServiceNow MCP REST API")
 
-def pretty(obj):
+# ----------------------------
+# Utilities
+# ----------------------------
+
+def pretty(obj: Any):
+    """Existing pretty wrapper kept for endpoints that return JSON to client."""
     try:
-        #return json.loads(json.dumps(obj, default=lambda o: getattr(o, "__dict__", str(o))))
-        
-        # Case 1: If already a dict, pretty-print it
         if isinstance(obj, dict):
             return pretty_content(obj)
-
-        # Case 2: If it looks like the messy TextContent(...) string
         if isinstance(obj, str) and "text='" in obj:
             return extract_and_format(obj)
-
-        # Case 3: If it's an object but has a `text` attribute (like TextContent)
         if hasattr(obj, "text"):
             return extract_and_format(str(obj))
-
-        # Case 4: Fallback for other objects
         return extract_and_format(str(obj))
-        
-        '''
-        #json = json.loads(json.dumps(obj, default=lambda o: getattr(o, "__dict__", str(o))))
-        #return pretty_content(json)
-        # Directly handle dicts or lists
-        if isinstance(obj, dict):
-            return pretty_content(obj)
-        if hasattr(obj, "__dict__"):  # Convert custom objects
-            return pretty_content(obj.__dict__)
-        return pretty_content(obj)
-        '''
     except Exception:
         return str(obj)
+
+def pretty_content(result: Dict[str, Any]):
+    return json.dumps(result, indent=4)
+
+def extract_and_format(raw_string: str):
+    match = re.search(r"text='(.*?)'(?:,|\))", raw_string, re.S)
+    if not match:
+        # maybe already JSON?
+        try:    
+            return json.loads(raw_string)
+        except Exception:
+            return "No JSON found in text field"
+    inner_raw = match.group(1)
+    unescaped = inner_raw.encode('utf-8').decode('unicode_escape')
+    data = json.loads(unescaped)
+    new_json = json.dumps(data, indent=4)
+    return json.loads(new_json)
+
+def sanitize_filename(name: str) -> str:
+    sanitized = re.sub(r'[\\/*?:"<>|\r\n\t]+', "_", name)
+    sanitized = sanitized.strip().strip(".")
+    return sanitized[:100]
+
+def html_to_text(html_content: str) -> str:
+    soup = BeautifulSoup(html_content, "html.parser")
+    return soup.get_text(separator="\n").strip()
+
+def normalize_to_dict(result: Any) -> Dict[str, Any]:
+    """Normalize outputs from call_tool into a python dict."""
+    if isinstance(result, dict):
+        return result
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except Exception:
+            pass
+    # try existing extractor
+    parsed = extract_and_format(str(result))
+    if isinstance(parsed, str):
+        try:
+            return json.loads(parsed)
+        except Exception:
+            return {"raw": parsed}
+    return parsed
+
+async def retry_call_tool(tool_name: str, args: Dict[str, Any], *, retries=4, base_delay=0.5, max_delay=4.0) -> Dict[str, Any]:
+    attempt = 0
+    while True:
+        try:
+            res = await call_tool(cfg, tool_name, args)
+            return normalize_to_dict(res)
+        except Exception as e:
+            attempt += 1
+            if attempt > retries:
+                raise
+            # jittered exponential backoff
+            delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+            delay = delay * (0.7 + 0.6 * random.random())
+            progress["last_error"] = f"{tool_name}: {e}"
+            await asyncio.sleep(delay)
+
+# ----------------------------
+# Public endpoints
+# ----------------------------
 
 @app.get("/tools")
 async def get_tools():
@@ -96,8 +155,9 @@ async def discover():
 
 @app.get("/list-kbs")
 async def list_kbs():
-    result = await call_tool(cfg, "list_knowledge_bases", {})
-    return pretty(result)
+    result = await retry_call_tool("list_knowledge_bases", {})
+    return result
+
 
 @app.get("/list-articles")
 async def list_articles(kb: str = Query(..., description="Knowledge Base sys_id")):
@@ -109,122 +169,147 @@ async def list_articles(kb: str = Query(..., description="Knowledge Base sys_id"
                              ["kb_sys_id", "kb_id", "knowledge_base_id", "id", "kb"],
                              "kb_id")
     args = {key: kb}
-    result = await call_tool(cfg, "list_articles", args)
-    return pretty(result)
-
-'''
-@app.get("/get-article")
-async def get_article(article_id: str = Query(..., description="Article sys_id")):
-    tools = await list_tools(cfg)
-    target = next((t for t in tools if getattr(t, "name", "") == "get_article"), None)
-    key = "id"
-    if target:
-        key = choose_arg_key(getattr(target, "input_schema", {}) or {},
-                             ["sys_id", "id", "article_id", "record_id"],
-                             "id")
-    args = {key: article_id}
-    result = await call_tool(cfg, "get_article", args)
-    return pretty(result)
-'''
+    result = await retry_call_tool("list_articles", args)
+    return result
 
 @app.get("/get-article")
 async def get_article(article_id: str = Query(..., description="Article sys_id")):
     args = {"article_id": article_id}
-    result = await call_tool(cfg, "get_article", args)
-    return pretty(result)
+    result = await retry_call_tool("get_article", args)
+    return result
 
+# ----------------------------
+# Optimized download flow
+# ----------------------------
 
 @app.get("/download")
-async def download_kb_and_articles():
-    print("Starting download of all articles in each KB...")
-    DOWNLOAD_DIR = "downloads"
-    os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+async def download_kb_and_articles(background_tasks: BackgroundTasks,
+                                   concurrency: int = Query(8, ge=1, le=64)):
+    """
+    Starts a background job to fetch all KBs, all articles, and generate PDFs.
+    Returns immediately with a status pointer.
+    """
+    if progress["running"]:
+        return {"success": False, "message": "A download job is already running."}
 
-    client = TestClient(app)
-    timeout = 300  # 5 minutes
+    progress.update({
+        "running": True,
+        "kb_total": 0,
+        "kb_done": 0,
+        "article_total": 0,
+        "article_done": 0,
+        "errors": 0,
+        "last_error": None,
+    })
+    
+    background_tasks.add_task(download_all_articles_job, concurrency)
+    file_counter = 0  # reset counter for this job
+    return {"success": True, "message": "Download started", "check_status_at": "/download/status"}
 
-    # Step 1: Get KB IDs
-    response = client.get("/list-kbs", timeout=timeout)
-    if response.status_code != 200:
-        return {"success": False, "message": "Failed to fetch knowledge bases"}
+@app.get("/download/status")
+async def download_status():
+    return progress
 
-    kb_data = response.json()
-    kb_ids = [kb["id"] for kb in kb_data.get("knowledge_bases", [])]
+async def download_all_articles_job(concurrency: int):
+    try:
+        # Step 1: KBs
+        kb_data = await retry_call_tool("list_knowledge_bases", {})
+        kb_ids = [kb["id"] for kb in kb_data.get("knowledge_bases", [])]
+        progress["kb_total"] = len(kb_ids)
 
-    # Step 2 & 3: Fetch article IDs & download articles
-    article_ids_map = {}
-    total_articles_downloaded = 0
+        sem = asyncio.Semaphore(concurrency)
 
-    for kb_id in kb_ids:
-        articles_resp = client.get(f"/list-articles?kb={kb_id}", timeout=timeout)
-        if articles_resp.status_code != 200:
-            print(f"Failed to fetch articles for KB {kb_id}")
-            continue
+        # Discover article IDs (sequential per KB to avoid hammering upstream)
+        all_article_ids: List[str] = []
+        for kb_id in kb_ids:
+            try:
+                articles_data = await list_articles_raw(kb_id)
+                article_ids = [a["id"]["value"] for a in articles_data.get("articles", [])]
+                all_article_ids.extend(article_ids)
+            except Exception as e:
+                progress["errors"] += 1
+                progress["last_error"] = f"list_articles({kb_id}): {e}"
+            finally:
+                progress["kb_done"] += 1
 
-        articles_data = articles_resp.json()
-        article_ids = [a["id"]["value"] for a in articles_data.get("articles", [])]
-        article_ids_map[kb_id] = article_ids
+        progress["article_total"] = len(all_article_ids)
 
-        for article_id in article_ids:
-            print(f"Downloading article {article_id} from KB {kb_id}...")
-            article_resp = client.get(f"/get-article?article_id={article_id}", timeout=timeout)
-            if article_resp.status_code == 200:
-                article_data = article_resp.json().get("article", {})
-                title = article_data.get("title", "Untitled Article")
-                html_text = article_data.get("text", "")
-                plain_text = html_to_text(html_text)
+        # Step 2: Download + PDF in parallel with cap
+        async def worker(article_id: str, index: int):
+            async with sem:
+                await download_and_save_article(article_id, index)
 
-                safe_title = sanitize_filename(title)[:50]  # Limit filename length
-                pdf_path = os.path.join(DOWNLOAD_DIR, f"{total_articles_downloaded}_{article_id}_{safe_title}.pdf")
+        # tasks = [asyncio.create_task(worker(aid)) for aid in all_article_ids]
+        tasks = [
+            asyncio.create_task(worker(aid, i + 1))
+            for i, aid in enumerate(all_article_ids)
+        ]
+        # Use as_completed to update progress promptly
+        for fut in asyncio.as_completed(tasks):
+            try:
+                await fut
+            except Exception as e:
+                progress["errors"] += 1
+                progress["last_error"] = f"article_task: {e}"
+            finally:
+                progress["article_done"] += 1
 
-                # Generate PDF for each article
-                c = canvas.Canvas(pdf_path, pagesize=LETTER)
-                c.setFont("Helvetica-Bold", 14)
-                c.drawString(50, 750, title)
-                c.setFont("Helvetica", 12)
-                y = 720
-                for line in plain_text.splitlines():
-                    c.drawString(50, y, line[:90])  # wrap long lines
-                    y -= 20
-                    if y < 50:
-                        c.showPage()
-                        c.setFont("Helvetica", 12)
-                        y = 750
-                c.save()
+    finally:
+        progress["running"] = False
 
-                total_articles_downloaded += 1
-                print(f"Saved article {article_id} as PDF: {pdf_path}")
-                print(f"Downloaded {total_articles_downloaded} articles so far...")
-            else:
-                print(f"Failed to download article {article_id}")
+async def list_articles_raw(kb_id: str) -> Dict[str, Any]:
+    tools = await list_tools(cfg)
+    target = next((t for t in tools if getattr(t, "name", "") == "list_articles"), None)
+    key = "kb_id"
+    if target:
+        key = choose_arg_key(getattr(target, "input_schema", {}) or {},
+                             ["kb_sys_id", "kb_id", "knowledge_base_id", "id", "kb"],
+                             "kb_id")
+    args = {key: kb_id}
+    return await retry_call_tool("list_articles", args)
 
-    print("Download completed.")
-    return JSONResponse(content={
-        "success": True,
-        "KBs": {
-            "kb_ids": kb_ids,
-            "count": len(kb_ids)
-        },
-        "article_ids": {
-            **article_ids_map,
-            "count": sum(len(v) for v in article_ids_map.values())
-        },
-        "articles": {
-            "downloaded": True,
-            "count": total_articles_downloaded
-        }
-    })  
+async def download_and_save_article(article_id: str, index: int):
+    # Fetch article via MCP
+    data = await retry_call_tool("get_article", {"article_id": article_id})
+    article = data.get("article", {}) if isinstance(data, dict) else {}
+    title = article.get("title", "Untitled Article")
+    html_text = article.get("text", "")
+    plain_text = html_to_text(html_text)
 
+    safe_title = sanitize_filename(title)[:50]
+    pdf_path = os.path.join(DOWNLOAD_DIR, f"{index}_{article_id}_{safe_title}.pdf")
+
+    if os.path.exists(pdf_path):
+        return
+
+    # Offload CPU/file I/O to thread
+    await asyncio.to_thread(write_pdf, pdf_path, title, plain_text)
+
+def write_pdf(pdf_path: str, title: str, plain_text: str):
+    c = canvas.Canvas(pdf_path, pagesize=LETTER)
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(50, 750, title)
+    c.setFont("Helvetica", 12)
+    y = 720
+    for line in plain_text.splitlines():
+        c.drawString(50, y, line[:90])
+        y -= 20
+        if y < 50:
+            c.showPage()
+            c.setFont("Helvetica", 12)
+            y = 750
+    c.save()
+
+# ----------------------------
+# Upload / Index / Search (unchanged API, minor robustness)
+# ----------------------------
 
 @app.get("/upload")
 async def upload_files_from_downloads():
     print("Starting upload and indexing of PDF files from downloads...")
-    count_of_files = 0
-    DOWNLOAD_DIR = "downloads"
     stored_files = []
     chunk_size = 500
 
-    # Get all PDF files from downloads folder
     pdf_files = [f for f in os.listdir(DOWNLOAD_DIR) if f.lower().endswith(".pdf")]
 
     if not pdf_files:
@@ -233,11 +318,14 @@ async def upload_files_from_downloads():
             "message": "No PDF files found in the downloads folder."
         })
 
+    total_chunks = 0
+    all_embeddings: List[np.ndarray] = []
+    new_metadata: List[Dict[str, str]] = []
+
     for filename in pdf_files:
         file_path = os.path.join(DOWNLOAD_DIR, filename)
         stored_files.append(filename)
 
-        # Step 1: Read PDF content
         text = ""
         try:
             reader = PdfReader(file_path)
@@ -251,39 +339,36 @@ async def upload_files_from_downloads():
             print(f"Skipping empty PDF: {filename}")
             continue
 
-        # Step 2: Chunk content
+        # Chunk
         chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
+        total_chunks += len(chunks)
 
-        # Step 3: Generate embeddings
+        # Embeddings (batch)
         embeddings = embedding_model.encode(chunks)
         embeddings = np.array(embeddings).astype('float32')
 
-        # Step 4: Add to FAISS index
-        faiss_index.add(embeddings)
-
-        # Step 5: Store metadata for each chunk
+        all_embeddings.append(embeddings)
         for chunk in chunks:
-            metadata_store.append({
-                "filename": filename,
-                "chunk": chunk
-            })
-        count_of_files += 1
-        print(f"Processed {filename}, total files processed: {count_of_files}")
-    print("Upload and indexing completed. Processed {count_of_files} files.")
+            new_metadata.append({"filename": filename, "chunk": chunk})
 
+    if new_metadata:
+        # Add to FAISS in one go
+        concat_embeddings = np.concatenate(all_embeddings, axis=0)
+        faiss_index.add(concat_embeddings)
+        metadata_store.extend(new_metadata)
 
-    # Persist FAISS index & metadata
-    faiss.write_index(faiss_index, INDEX_PATH)
-    with open(METADATA_PATH, "wb") as f:
-        pickle.dump(metadata_store, f)
+        # Persist
+        faiss.write_index(faiss_index, INDEX_PATH)
+        with open(METADATA_PATH, "wb") as f:
+            pickle.dump(metadata_store, f)
 
     return JSONResponse(content={
         "success": True,
         "message": f"Processed and indexed {len(stored_files)} PDF(s) from downloads.",
         "files": stored_files,
-        "total_vectors": faiss_index.ntotal
+        "total_vectors": faiss_index.ntotal,
+        "chunks_added": total_chunks
     })
-
 
 @app.get("/search")
 async def search(query: str = Query(..., description="Search query"),
@@ -294,14 +379,11 @@ async def search(query: str = Query(..., description="Search query"),
             "message": "No data found in the FAISS index. Please upload files first."
         })
 
-    # Step 1: Create embedding for the query
     query_embedding = embedding_model.encode([query])
     query_embedding = np.array(query_embedding).astype('float32')
 
-    # Step 2: Perform FAISS search
     distances, indices = faiss_index.search(query_embedding, top_k)
 
-    # Step 3: Retrieve metadata
     results = []
     for idx, dist in zip(indices[0], distances[0]):
         if idx == -1:
@@ -319,77 +401,3 @@ async def search(query: str = Query(..., description="Search query"),
         "top_k": len(results),
         "results": results
     })
-
-
-
-
-#Utility Methods
-
-def pretty_content(result):
-    #print("called pretty_content with:", result)
-
-    # Here, you can directly format if result contains the JSON dict
-    return json.dumps(result, indent=4)
-
-    '''
-    # If result is already a dict, don't json.loads() again
-    if isinstance(result, dict):
-        outer_data = result
-    else:
-        # Try to parse string as JSON
-        outer_data = json.loads(result)
-
-    # Extract inner JSON string
-    inner_json_str = outer_data["content"][0]["text"]
-
-    # Parse inner JSON
-    inner_data = json.loads(inner_json_str)
-
-    # Pretty-print
-    formatted_json = json.dumps(inner_data, indent=4)
-    print(formatted_json)
-    return formatted_json
-    '''
-    
-    '''return {
-        "success": not result.get("isError", False),
-        "data": result.get("content"),
-        "raw": result
-    }'''
-
-
-def extract_and_format(raw_string):
-
-    #print("called extract_and_format with:", raw_string)
-
-    # Step 1: Extract the text='...' value using regex
-    #match = re.search(r"text='(.*?)', annotations", raw_string)
-    match = re.search(r"text='(.*?)'(?:,|\))", raw_string, re.S)  # allows ) or , after the string
-    
-    if not match:
-        return "No JSON found in text field"
-    
-    inner_raw = match.group(1)  # The JSON string with escapes
-
-    # Step 2: Unescape the string (convert \\n -> \n and \\\" -> \")
-    unescaped = inner_raw.encode('utf-8').decode('unicode_escape')
-
-    # Step 3: Parse JSON
-    data = json.loads(unescaped)
-
-    # Step 4: Pretty print JSON
-    # return json.dumps(data, indent=4)
-    new_json = json.dumps(data, indent=4)
-    return json.loads(new_json)
-
-# Utility: Sanitize filename
-def sanitize_filename(name: str) -> str:
-    # Replace forbidden characters and control chars
-    sanitized = re.sub(r'[\\/*?:"<>|\r\n\t]+', "_", name)
-    sanitized = sanitized.strip().strip(".")  # remove trailing dots/spaces
-    return sanitized[:100]  # Limit to 100 chars for safety
-
-# Utility: Convert HTML to plain text
-def html_to_text(html_content: str) -> str:
-    soup = BeautifulSoup(html_content, "html.parser")
-    return soup.get_text(separator="\n").strip()

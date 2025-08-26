@@ -5,7 +5,11 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY . .
+# Copy only required files and directories
+COPY sn_mcp_client/ ./sn_mcp_client/
+COPY config.client.ssc.json .
+COPY pyproject.toml .
+
 
 EXPOSE 8000
 
