@@ -16,6 +16,7 @@ import numpy as np
 from PyPDF2 import PdfReader
 import random
 import time
+from google.cloud import storage
 
 # ----------------------------
 # Config & Globals
@@ -24,11 +25,28 @@ import time
 CONFIG_PATH = "config.client.ssc.json"
 cfg = MCPConfig.load(CONFIG_PATH)
 
+# Directories for downloads and uploads
+
 DOWNLOAD_DIR = "downloads"
 UPLOAD_DIR = "uploads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
+# NEW: Storage mode and bucket configuration
+STORAGE_MODE = os.getenv("storage_mode", "local").lower()
+GCP_BUCKET_NAME = os.getenv("GCP_BUCKET_NAME", "")
+
+if STORAGE_MODE == "cloud" and not GCP_BUCKET_NAME:
+    raise ValueError("GCP_BUCKET_NAME must be set when storage_mode=cloud")
+
+# If cloud, initialize GCP client
+gcp_client = None
+bucket = None
+if STORAGE_MODE == "cloud":
+    gcp_client = storage.Client()
+    bucket = gcp_client.bucket(GCP_BUCKET_NAME)
+
+# FAISS index and metadata
 INDEX_PATH = os.path.join(UPLOAD_DIR, "vector_index.faiss")
 METADATA_PATH = os.path.join(UPLOAD_DIR, "vector_metadata.pkl")
 
@@ -300,6 +318,13 @@ def write_pdf(pdf_path: str, title: str, plain_text: str):
             y = 750
     c.save()
 
+    # NEW: Upload to GCP bucket if in cloud mode
+    if STORAGE_MODE == "cloud":
+        blob_name = os.path.basename(pdf_path)
+        blob = bucket.blob(f"downloads/{blob_name}")
+        blob.upload_from_filename(pdf_path)
+        os.remove(pdf_path)  # Remove local copy after upload
+
 # ----------------------------
 # Upload / Index / Search (unchanged API, minor robustness)
 # ----------------------------
@@ -310,7 +335,13 @@ async def upload_files_from_downloads():
     stored_files = []
     chunk_size = 500
 
-    pdf_files = [f for f in os.listdir(DOWNLOAD_DIR) if f.lower().endswith(".pdf")]
+     # NEW: Decide source based on storage mode
+    if STORAGE_MODE == "cloud":
+        # List files from GCP bucket under 'downloads/'
+        blobs = list(bucket.list_blobs(prefix="downloads/"))
+        pdf_files = [b.name for b in blobs if b.name.lower().endswith(".pdf")]
+    else:
+        pdf_files = [f for f in os.listdir(DOWNLOAD_DIR) if f.lower().endswith(".pdf")]
 
     if not pdf_files:
         return JSONResponse(content={
@@ -323,8 +354,16 @@ async def upload_files_from_downloads():
     new_metadata: List[Dict[str, str]] = []
 
     for filename in pdf_files:
-        file_path = os.path.join(DOWNLOAD_DIR, filename)
-        stored_files.append(filename)
+        if STORAGE_MODE == "cloud":
+            # Download from GCP to memory
+            blob = bucket.blob(filename)
+            tmp_path = os.path.join("/tmp", os.path.basename(filename))
+            blob.download_to_filename(tmp_path)
+            file_path = tmp_path
+            stored_files.append(os.path.basename(filename))
+        else:
+            file_path = os.path.join(DOWNLOAD_DIR, filename)
+            stored_files.append(filename)
 
         text = ""
         try:
@@ -349,7 +388,7 @@ async def upload_files_from_downloads():
 
         all_embeddings.append(embeddings)
         for chunk in chunks:
-            new_metadata.append({"filename": filename, "chunk": chunk})
+            new_metadata.append({"filename": os.path.basename(filename), "chunk": chunk})
 
     if new_metadata:
         # Add to FAISS in one go
@@ -364,7 +403,7 @@ async def upload_files_from_downloads():
 
     return JSONResponse(content={
         "success": True,
-        "message": f"Processed and indexed {len(stored_files)} PDF(s) from downloads.",
+        "message": f"Processed and indexed {len(stored_files)} PDF(s).",
         "files": stored_files,
         "total_vectors": faiss_index.ntotal,
         "chunks_added": total_chunks
