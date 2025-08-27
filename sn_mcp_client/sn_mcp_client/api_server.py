@@ -217,8 +217,7 @@ async def get_article(article_id: str = Query(..., description="Article sys_id")
 # ----------------------------
 
 @app.get("/download")
-async def download_kb_and_articles(background_tasks: BackgroundTasks,
-                                   concurrency: int = Query(8, ge=1, le=64)):
+async def download_kb_and_articles(concurrency: int = Query(2, ge=1, le=64)):
     """
     Starts a background job to fetch all KBs, all articles, and generate PDFs.
     Returns immediately with a status pointer.
@@ -236,8 +235,9 @@ async def download_kb_and_articles(background_tasks: BackgroundTasks,
         "last_error": None,
     })
     
-    background_tasks.add_task(download_all_articles_job, concurrency)
-    file_counter = 0  # reset counter for this job
+    #background_tasks.add_task(download_all_articles_job, concurrency)
+    asyncio.create_task(download_all_articles_job(concurrency))  # Fire-and-forget
+    # file_counter = 0  # reset counter for this job
     return {"success": True, "message": "Download started", "check_status_at": "/download/status"}
 
 @app.get("/download/status")
@@ -246,15 +246,13 @@ async def download_status():
 
 async def download_all_articles_job(concurrency: int):
     try:
-        # Step 1: KBs
         kb_data = await retry_call_tool("list_knowledge_bases", {})
         kb_ids = [kb["id"] for kb in kb_data.get("knowledge_bases", [])]
         progress["kb_total"] = len(kb_ids)
 
         sem = asyncio.Semaphore(concurrency)
-
-        # Discover article IDs (sequential per KB to avoid hammering upstream)
         all_article_ids: List[str] = []
+
         for kb_id in kb_ids:
             try:
                 articles_data = await list_articles_raw(kb_id)
@@ -262,34 +260,46 @@ async def download_all_articles_job(concurrency: int):
                 all_article_ids.extend(article_ids)
             except Exception as e:
                 progress["errors"] += 1
-                progress["last_error"] = f"list_articles({kb_id}): {e}"
+                progress["last_error"] = f"list_articles({kb_id}): {str(e)}"
             finally:
                 progress["kb_done"] += 1
 
         progress["article_total"] = len(all_article_ids)
+        progress["failed_articles"] = []
 
-        # Step 2: Download + PDF in parallel with cap
         async def worker(article_id: str, index: int):
             async with sem:
-                await download_and_save_article(article_id, index)
+                try:
+                    await download_and_save_article(article_id, index)
+                except Exception as inner_e:
+                    progress["errors"] += 1
+                    progress["failed_articles"].append(article_id)
+                    if not progress.get("last_error"):
+                        progress["last_error"] = f"Error for article {article_id}: {repr(inner_e)}"
+                finally:
+                    progress["article_done"] += 1
 
-        # tasks = [asyncio.create_task(worker(aid)) for aid in all_article_ids]
-        tasks = [
-            asyncio.create_task(worker(aid, i + 1))
-            for i, aid in enumerate(all_article_ids)
-        ]
-        # Use as_completed to update progress promptly
-        for fut in asyncio.as_completed(tasks):
-            try:
-                await fut
-            except Exception as e:
-                progress["errors"] += 1
-                progress["last_error"] = f"article_task: {e}"
-            finally:
-                progress["article_done"] += 1
+        tasks = [asyncio.create_task(worker(aid, i + 1)) for i, aid in enumerate(all_article_ids)]
+        await asyncio.gather(*tasks)  # gather ensures all tasks finish even if some fail
+
+        # Step 3: Retry failed ones
+        if progress["failed_articles"]:
+            retry_list = progress["failed_articles"].copy()
+            progress["failed_articles"] = []
+            for i, aid in enumerate(retry_list):
+                try:
+                    await download_and_save_article(aid, i + 1)
+                except Exception as e:
+                    progress["errors"] += 1
+                    progress["failed_articles"].append(aid)
+                    if not progress.get("last_error"):
+                        progress["last_error"] = f"Retry failed for article {aid}: {repr(e)}"
 
     finally:
         progress["running"] = False
+
+
+
 
 async def list_articles_raw(kb_id: str) -> Dict[str, Any]:
     tools = await list_tools(cfg)

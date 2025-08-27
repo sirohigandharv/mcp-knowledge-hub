@@ -68,7 +68,11 @@ def cmd_get_article(cfg_path: str, article_id: str):
     # Discover schema to choose the right key automatically
     tools = asyncio.run(list_tools(cfg))
     target = next((t for t in tools if getattr(t, "name", "") == "get_article"), None)
-    key = "id"
+    if cfg.mode == "stdio":
+        key = "article_id"
+    else:
+        key = "id"  # default for SSE mode
+    
     if target:
         key = choose_arg_key(getattr(target, "input_schema", {}) or {},
                              ["sys_id", "id", "article_id", "record_id"],
@@ -80,7 +84,7 @@ def cmd_get_article(cfg_path: str, article_id: str):
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="sn-mcp", description="Python MCP client for ServiceNow MCP server (stdio).")
-    p.add_argument("--config", default="config.client.json", help="Path to client config JSON (default: config.client.json)")
+    p.add_argument("--config", default="config.client.stdio.json", help="Path to client config JSON (default: config.client.stdio.json)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("discover", help="List tools with input schemas (JSON)")
