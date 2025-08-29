@@ -1,6 +1,6 @@
 {
   "mode": "stdio",
-  "command": "C:/Users/Admin/anaconda3/envs/myenv/python.exe",
+  "command": "C:/workspace/EliteA/service-now-solution/mcp-knowledge-hub/servicenow-mcp/.venv/Scripts/python.exe",
   "args": [
     "-m",
     "servicenow_mcp.cli"

@@ -212,6 +212,56 @@ async def get_article(article_id: str = Query(..., description="Article sys_id")
     result = await retry_call_tool("get_article", args)
     return result
 
+@app.get("/onlinesearch")
+async def online_search(
+    query: str = Query(..., description="Search phrase for articles"),
+    limit: int = Query(50, description="Maximum number of articles to return"),
+    knowledge_base: Optional[str] = Query(None, description="Optional Knowledge Base filter")
+):
+    """
+    Perform an online search for knowledge articles using the list_articles tool.
+    Supports global or KB-specific search.
+    """
+    try:
+        # Construct request payload based on discovered schema
+        args = {
+            "limit": limit,
+            "query": query,
+            "knowledge_base": knowledge_base  # can be None if not provided
+        }
+
+        articles_data = await retry_call_tool("list_articles", args)
+
+        results = []
+        for art in articles_data.get("articles", []):
+            results.append({
+                "article_id": (
+                    art.get("id", {}).get("value")
+                    if isinstance(art.get("id"), dict)
+                    else art.get("id")
+                ),
+                "title": art.get("title", ""),
+                "short_description": art.get("short_description", ""),
+                "knowledge_base": (
+                    art.get("knowledge_base", {}).get("value")
+                    if isinstance(art.get("knowledge_base"), dict)
+                    else art.get("knowledge_base")
+                )
+            })
+
+        return {
+            "success": True,
+            "query": query,
+            "limit": limit,
+            "total_matches": len(results),
+            "results": results
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+
 # ----------------------------
 # Optimized download flow
 # ----------------------------
@@ -460,11 +510,20 @@ async def search(query: str = Query(..., description="Search query"),
         if idx == -1:
             continue
         meta = metadata_store[idx]
+        # Extract KB ID and Article from filename
+        filename = meta["filename"].replace(".pdf", "")
+        parts = filename.split("_", 2)  # split only first two underscores
+        # parts[0] = '2', parts[1] = '021e2cc4dbde578073cb78b5ae961917', parts[2] = 'Prevent further recurrence...'
+        article_id = parts[1] if len(parts) > 1 else ""
+        article = parts[2] if len(parts) > 2 else ""
+        
         results.append({
-            "filename": meta["filename"],
+            "Article Title": article,
+            "Article ID": article_id,
             "chunk": meta["chunk"],
             "distance": float(dist)
         })
+
 
     return JSONResponse(content={
         "success": True,
