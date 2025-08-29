@@ -18,6 +18,23 @@ import random
 import time
 from google.cloud import storage
 
+
+from nltk.corpus import stopwords, wordnet
+from nltk.tokenize import word_tokenize
+#from nltk import pos_tag
+from itertools import combinations
+import nltk
+
+# Download required NLTK resources (only run once)
+nltk.download('punkt')
+nltk.download('punkt_tab')
+nltk.download('stopwords')
+nltk.download('wordnet')
+nltk.download('averaged_perceptron_tagger')
+nltk.download('averaged_perceptron_tagger_eng')
+
+
+
 # ----------------------------
 # Config & Globals
 # ----------------------------
@@ -212,6 +229,8 @@ async def get_article(article_id: str = Query(..., description="Article sys_id")
     result = await retry_call_tool("get_article", args)
     return result
 
+
+
 @app.get("/onlinesearch")
 async def online_search(
     query: str = Query(..., description="Search phrase for articles"),
@@ -219,46 +238,105 @@ async def online_search(
     knowledge_base: Optional[str] = Query(None, description="Optional Knowledge Base filter")
 ):
     """
-    Perform an online search for knowledge articles using the list_articles tool.
-    Supports global or KB-specific search.
+    Perform an online semantic search for knowledge articles using the list_articles tool.
+    - First tries the original query directly.
+    - If no results, expands the query into multiple related searches and combines the results.
     """
     try:
-        # Construct request payload based on discovered schema
+        # Step 1: Try the original query first
         args = {
             "limit": limit,
             "query": query,
-            "knowledge_base": knowledge_base  # can be None if not provided
+            "knowledge_base": knowledge_base
         }
 
-        articles_data = await retry_call_tool("list_articles", args)
+        try:
+            original_data = await retry_call_tool("list_articles", args)
+        except Exception as e:
+            print(f"Error while querying original phrase '{query}': {e}")
+            original_data = {"articles": []}
 
-        results = []
-        for art in articles_data.get("articles", []):
-            results.append({
-                "article_id": (
+        initial_results = []
+        seen_ids: Set[str] = set()
+
+        for art in original_data.get("articles", []):
+            article_id = (
+                art.get("id", {}).get("value")
+                if isinstance(art.get("id"), dict)
+                else art.get("id")
+            )
+            if article_id not in seen_ids:
+                seen_ids.add(article_id)
+                initial_results.append({
+                    "article_id": article_id,
+                    "title": art.get("title", ""),
+                    "short_description": art.get("short_description", ""),
+                    "knowledge_base": (
+                        art.get("knowledge_base", {}).get("value")
+                        if isinstance(art.get("knowledge_base"), dict)
+                        else art.get("knowledge_base")
+                    )
+                })
+
+        # If we found results for the original query, return them immediately
+        if initial_results:
+            return {
+                "success": True,
+                "original_query": query,
+                "expanded_queries": [],
+                "total_matches": len(initial_results),
+                "results": initial_results
+            }
+
+        # Step 2: Fallback – Expand query only if no results found
+        query_variants = generate_query_variants(query)
+        print(f"Generated variants: {query_variants}")
+
+        all_results = []
+        for q in query_variants:
+            args = {
+                "limit": limit,
+                "query": q,
+                "knowledge_base": knowledge_base
+            }
+
+            try:
+                articles_data = await retry_call_tool("list_articles", args)
+            except Exception as e:
+                print(f"Error while querying variant '{q}': {e}")
+                continue  # Skip this variant and move to the next
+
+            for art in articles_data.get("articles", []):
+                article_id = (
                     art.get("id", {}).get("value")
                     if isinstance(art.get("id"), dict)
                     else art.get("id")
-                ),
-                "title": art.get("title", ""),
-                "short_description": art.get("short_description", ""),
-                "knowledge_base": (
-                    art.get("knowledge_base", {}).get("value")
-                    if isinstance(art.get("knowledge_base"), dict)
-                    else art.get("knowledge_base")
                 )
-            })
+
+                if article_id not in seen_ids:
+                    seen_ids.add(article_id)
+                    all_results.append({
+                        "article_id": article_id,
+                        "title": art.get("title", ""),
+                        "short_description": art.get("short_description", ""),
+                        "knowledge_base": (
+                            art.get("knowledge_base", {}).get("value")
+                            if isinstance(art.get("knowledge_base"), dict)
+                            else art.get("knowledge_base")
+                        )
+                    })
 
         return {
             "success": True,
-            "query": query,
-            "limit": limit,
-            "total_matches": len(results),
-            "results": results
+            "original_query": query,
+            "expanded_queries": query_variants,
+            "total_matches": len(all_results),
+            "results": all_results
         }
 
     except Exception as e:
         return {"success": False, "error": str(e)}
+
 
 
 
@@ -531,3 +609,86 @@ async def search(query: str = Query(..., description="Search query"),
         "top_k": len(results),
         "results": results
     })
+
+
+'''
+
+def generate_query_variants(query: str, max_combo_length: int = 3) -> list[str]:
+    """
+    Generate semantic query variants from a sentence:
+    - Removes unnecessary stopwords but keeps meaningful modifiers (POS-based)
+    - Extracts individual keywords
+    - Creates combinations of keywords
+    - Adds synonyms for each keyword
+    """
+    stop_words = set(stopwords.words('english'))
+    # Tokenize and keep only alphanumeric tokens
+    tokens = [w.lower() for w in word_tokenize(query) if w.isalnum()]
+    
+    # Part-of-speech tagging
+    pos_tags = pos_tag(tokens)
+    
+    # Keep nouns (NN), verbs (VB), adjectives (JJ), adverbs (RB)
+    keywords = [
+        word for word, pos in pos_tags
+        if pos.startswith(('N', 'V', 'J', 'R')) and word not in stop_words
+    ]
+    
+    variants = set()
+    
+    # Add cleaned base phrase
+    if keywords:
+        variants.add(" ".join(keywords))
+    
+    # Add individual keywords
+    for kw in keywords:
+        variants.add(kw)
+    
+    # Add combinations (pairs, triples)
+    for r in range(2, min(len(keywords), max_combo_length) + 1):
+        for combo in combinations(keywords, r):
+            variants.add(" ".join(combo))
+    
+    # Add synonyms (only 1–2 per word for relevance)
+    for kw in keywords:
+        for syn in wordnet.synsets(kw):
+            for lemma in syn.lemmas()[:2]:  # limit synonyms per word
+                synonym = lemma.name().replace("_", " ").lower()
+                if synonym != kw and synonym.isalnum():
+                    variants.add(synonym)
+    
+    return sorted(list(variants))
+
+'''
+
+def generate_query_variants(query: str, max_combo_length: int = 3) -> list[str]:
+    """
+    Generate query variants using only the actual words present in the input string.
+    - Removes stopwords
+    - Keeps only meaningful words
+    - Generates combinations (pairs, triples)
+    """
+    stop_words = set(stopwords.words('english'))
+    
+    # Tokenize and keep only alphanumeric tokens
+    tokens = [w.lower() for w in word_tokenize(query) if w.isalnum()]
+    
+    # Remove stopwords
+    keywords = [w for w in tokens if w not in stop_words]
+
+    variants = set()
+
+    # Add cleaned base phrase (if more than one word remains)
+    if keywords:
+        variants.add(" ".join(keywords))
+
+    # Add individual keywords
+    for kw in keywords:
+        variants.add(kw)
+
+    # Add combinations (pairs, triples)
+    for r in range(2, min(len(keywords), max_combo_length) + 1):
+        for combo in combinations(keywords, r):
+            variants.add(" ".join(combo))
+
+    return sorted(list(variants))
