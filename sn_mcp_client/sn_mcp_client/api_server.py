@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Query, BackgroundTasks
-from typing import Optional, Any, Dict, List
+from typing import Optional, Any, Dict, List, Tuple
 import asyncio
 import json
 import re
@@ -17,13 +17,12 @@ from PyPDF2 import PdfReader
 import random
 import time
 from google.cloud import storage
-
-
 from nltk.corpus import stopwords, wordnet
 from nltk.tokenize import word_tokenize
 #from nltk import pos_tag
 from itertools import combinations
 import nltk
+from openai import OpenAI
 
 # Download required NLTK resources (only run once)
 nltk.download('punkt')
@@ -96,6 +95,70 @@ if os.path.exists(METADATA_PATH):
         metadata_store = pickle.load(f)
 else:
     metadata_store = []
+
+
+# ---- Embeddings New ----
+from sentence_transformers import SentenceTransformer
+import faiss, os, pickle
+from typing import List, Dict, Any, Optional
+
+EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
+embedding_model = SentenceTransformer(EMBED_MODEL_NAME)
+EMBED_DIM = embedding_model.get_sentence_embedding_dimension()
+
+# ---- FAISS + metadata paths ----
+INDEX_PATH_NEW = os.path.join(UPLOAD_DIR, "kb.index")
+META_PATH_NEW  = os.path.join(UPLOAD_DIR, "kb_meta.pkl")
+
+# For cloud mode, define blob names
+if STORAGE_MODE == "cloud":
+    INDEX_BLOB_NEW = "uploads/kb.index"
+    META_BLOB_NEW  = "uploads/kb_meta.pkl"
+
+    # Download existing index & metadata if present in GCP bucket
+    if bucket.blob(INDEX_BLOB_NEW).exists():
+        tmp_index = "/tmp/kb.index"
+        bucket.blob(INDEX_BLOB_NEW).download_to_filename(tmp_index)
+        INDEX_PATH_NEW = tmp_index
+
+    if bucket.blob(META_BLOB_NEW).exists():
+        tmp_meta = "/tmp/kb_meta.pkl"
+        bucket.blob(META_BLOB_NEW).download_to_filename(tmp_meta)
+        META_PATH_NEW = tmp_meta
+
+# ---- FAISS index initialization ----
+index: Optional[faiss.Index] = None
+metadata_store: List[Dict[str, Any]] = []
+
+def load_or_init_index():
+    """Load existing FAISS + metadata or create a new one."""
+    global index, metadata_store
+    if os.path.exists(INDEX_PATH_NEW) and os.path.exists(META_PATH_NEW):
+        index = faiss.read_index(INDEX_PATH_NEW)
+        with open(META_PATH_NEW, "rb") as f:
+            metadata_store[:] = pickle.load(f)
+    else:
+        index = faiss.IndexFlatIP(EMBED_DIM)  # cosine similarity via inner product
+
+def persist_index():
+    """Persist FAISS + metadata locally and upload to GCP if in cloud mode."""
+    faiss.write_index(index, INDEX_PATH_NEW)
+    with open(META_PATH_NEW, "wb") as f:
+        pickle.dump(metadata_store, f)
+
+    if STORAGE_MODE == "cloud":
+        bucket.blob(INDEX_BLOB_NEW).upload_from_filename(INDEX_PATH_NEW)
+        bucket.blob(META_BLOB_NEW).upload_from_filename(META_PATH_NEW)
+
+load_or_init_index()
+
+# ---- LLM (optional, used in /searchquery) ----
+USE_OPENAI = bool(os.getenv("OPENAI_API_KEY"))
+if USE_OPENAI:
+    openai_client = OpenAI()
+    LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
+
+
 
 # Simple progress tracker in-memory
 progress = {
@@ -692,3 +755,409 @@ def generate_query_variants(query: str, max_combo_length: int = 3) -> list[str]:
             variants.add(" ".join(combo))
 
     return sorted(list(variants))
+
+
+
+# New Embeddings - Index and Search
+
+def extract_article_text(article: Dict[str, Any]) -> Tuple[str, Dict[str, Any]]:
+    """
+    Normalize article payload into a single text blob and structured metadata.
+    Expect fields like: title, body_html/body_md/body_text, url/permalink, kb_id, article_id
+    """
+    title = article.get("title") or article.get("name") or ""
+    url   = article.get("url") or article.get("permalink") or ""
+    kb_id = article.get("kb_id") or article.get("knowledge_base_id")
+    aid   = article.get("id") or article.get("article_id")
+
+    body_candidates = [
+        article.get("body_html"),
+        article.get("body_md"),
+        article.get("body"),
+        article.get("resolution_steps"),
+        article.get("content"),
+        article.get("description"),
+    ]
+    bodies = [b for b in body_candidates if b]
+    merged = "\n\n".join(bodies)
+
+    # Try to convert HTML/MD→text but keep raw if already plain.
+    text = html_to_text(merged)
+    if len(text.strip()) < 10 and isinstance(merged, str):
+        text = merged.strip()
+
+    meta = {
+        "kb_id": kb_id,
+        "article_id": aid if isinstance(aid, str) else (aid or {}).get("value", aid),
+        "title": title,
+        "url": url,
+    }
+    return text, meta
+
+# ---- Chunking ----
+def chunk_text(s: str, max_chars: int = 1200, overlap: int = 150) -> List[Tuple[str, int, int]]:
+    """
+    Simple char-based recursive splitter with overlap.
+    Returns list of (chunk, start_idx, end_idx).
+    """
+    s = s.strip()
+    if not s:
+        return []
+
+    chunks = []
+    i = 0
+    n = len(s)
+    while i < n:
+        end = min(i + max_chars, n)
+        # try to cut on whitespace if possible
+        cut = s.rfind("\n", i, end)
+        if cut == -1:
+            cut = s.rfind(" ", i, end)
+        if cut == -1 or cut <= i + 200:  # don't cut too early
+            cut = end
+        segment = s[i:cut].strip()
+        if segment:
+            chunks.append((segment, i, cut))
+        i = max(cut - overlap, cut)  # step with overlap but never backward
+    return chunks
+
+# ---- Embedding helpers ----
+def embed_texts(texts: List[str], batch_size: int = 64) -> np.ndarray:
+    vecs = []
+    for i in range(0, len(texts), batch_size):
+        batch = texts[i:i+batch_size]
+        e = embedding_model.encode(batch, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+        vecs.append(e)
+    return np.vstack(vecs) if vecs else np.zeros((0, EMBED_DIM), dtype="float32")
+
+
+# ---- Ingest (single op) ----
+@app.post("/ingest")
+async def ingest_all(concurrency: int = Query(4, ge=1, le=64)):
+    """
+    Single operation to build/refresh the RAG index:
+    - List KBs
+    - List articles per KB
+    - Fetch each article payload using existing MCP methods
+    - Extract text (from `text` field), chunk, embed
+    - Add to FAISS with metadata
+    """
+    load_or_init_index()
+
+    # Use your existing KB listing method
+    kbs = await list_kbs()
+    kb_list = kbs.get("knowledge_bases", []) if isinstance(kbs, dict) else kbs
+    kb_ids = [kb.get("id") for kb in kb_list]
+    if not kb_ids:
+        return JSONResponse({"success": False, "message": "No knowledge bases returned by MCP."})
+
+    sem = asyncio.Semaphore(concurrency)
+    new_chunks: List[str] = []
+    new_chunk_meta: List[Dict[str, Any]] = []
+
+    async def process_article(article_entry: Dict[str, Any], kb_id: str):
+        # Extract article ID (works with both string or dict)
+        art_id = (
+            article_entry.get("id")
+            if isinstance(article_entry.get("id"), str)
+            else (article_entry.get("id") or {}).get("value")
+        )
+
+        async with sem:
+            # Fetch full article using your existing helper
+            article_data = await get_article(art_id)
+            article = article_data.get("article", {})
+
+            # Use your known schema: "text" contains HTML
+            raw_html = article.get("text") or ""
+            text = html_to_text(raw_html).strip()
+
+            if not text or len(text) < 10:
+                print(f"Skipping empty article: {art_id}")
+                return
+
+            # Chunk & store
+            for chunk, start, end in chunk_text(text):
+                new_chunks.append(chunk)
+                new_chunk_meta.append({
+                    "kb_id": kb_id,
+                    "article_id": art_id,
+                    "title": article.get("title"),
+                    "url": article.get("url") or "",
+                    "char_start": start,
+                    "char_end": end,
+                    "preview": chunk[:240],
+                    "content": chunk
+                })
+
+    # Gather all articles across KBs
+    articles: List[Tuple[str, Dict[str, Any]]] = []
+    for kb_id in kb_ids:
+        try:
+            # Use your existing list_articles_raw() function
+            arr = await list_articles_raw(kb_id)
+            # Your existing response is a dict with "articles"
+            article_items = arr.get("articles", arr) if isinstance(arr, dict) else arr
+            for a in article_items:
+                articles.append((kb_id, a))
+        except Exception as e:
+            print(f"list_articles failed for KB {kb_id}: {e}")
+
+    # Process concurrently
+    tasks = [asyncio.create_task(process_article(a, kb_id)) for kb_id, a in articles]
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Embed & persist
+    vecs = embed_texts(new_chunks)
+    added = 0
+    if vecs.shape[0] > 0:
+        index.add(vecs)
+        metadata_store.extend(new_chunk_meta)
+        persist_index()
+        added = vecs.shape[0]
+
+    return JSONResponse({
+        "success": True,
+        "message": "Ingest complete",
+        "kb_count": len(kb_ids),
+        "article_count": len(articles),
+        "chunks_added": added,
+        "total_vectors": int(index.ntotal),
+    })
+
+
+# ---- Search + generate with citations ----
+def retrieve(query: str, k: int = 6) -> List[Tuple[int, float]]:
+    if index.ntotal == 0:
+        return []
+    qv = embed_texts([query])  # already normalized
+    scores, idxs = index.search(qv, k)
+    pairs = []
+    for i, s in zip(idxs[0].tolist(), scores[0].tolist()):
+        if i == -1:
+            continue
+        pairs.append((i, float(s)))
+    return pairs
+
+def build_citations(hits: List[Tuple[int, float]], min_score: float = 0.25) -> List[Dict[str, Any]]:
+    cites = []
+    for i, score in hits:
+        if score < min_score:
+            continue
+        m = metadata_store[i]
+        cites.append({
+            "rank": len(cites) + 1,
+            "score": score,
+            "kb_id": m.get("kb_id"),
+            "article_id": m.get("article_id"),
+            "title": m.get("title"),
+            "url": m.get("url"),
+            "char_start": m.get("char_start"),
+            "char_end": m.get("char_end"),
+            "preview": m.get("preview"),
+            "index": i,
+        })
+    return cites
+'''
+def build_llm_context(citations: List[Dict[str, Any]]) -> str:
+    """
+    Small, clean context block for the LLM. Each source is tagged [S1], [S2], ...
+    """
+    lines = []
+    for c in citations:
+        tag = f"[S{c['rank']}]"
+        meta = f"{tag} {c.get('title') or 'Untitled'} (KB: {c.get('kb_id')}, Article: {c.get('article_id')})"
+        url = c.get("url") or ""
+        if url:
+            meta += f" — {url}"
+        lines.append(meta)
+        # Use full chunk instead of just preview
+        lines.append(c.get("content") or c.get("preview") or "")
+        lines.append("")  # blank line
+    return "\n".join(lines)
+'''
+
+# --- Helper: deduplicate and build LLM context using full chunk content ---
+def dedupe_citations(citations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    seen = set()
+    unique = []
+    for c in citations:
+        key = (c.get("article_id"), c.get("char_start"))
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(c)
+    return unique
+
+def build_llm_context(citations: List[Dict[str, Any]], max_sources: int = 5) -> str:
+    """
+    Use full 'content' if available, otherwise use preview.
+    Deduplicates on (article_id, char_start) to avoid repeating same chunk.
+    """
+    citations = dedupe_citations(citations)
+    lines = []
+    for i, c in enumerate(citations[:max_sources], start=1):
+        tag = f"[S{i}]"
+        meta = f"{tag} {c.get('title') or 'Untitled'} (KB: {c.get('kb_id')}, Article: {c.get('article_id')})"
+        lines.append(meta)
+        # prefer full chunk content saved as 'content'
+        lines.append(c.get("content") or c.get("chunk") or c.get("preview") or "")
+        lines.append("")  # blank line
+    return "\n".join(lines)
+
+SYSTEM_INSTRUCTIONS = """\
+You are a practical technical support copilot for L2/L3 service engineers.
+Use ONLY the provided sources to answer. If the sources contain the answer,
+extract and summarize the actionable steps or troubleshooting guidance in
+concise bullet points. Include inline citations like [S1], [S2] next to each
+step that comes from a source. If the sources are incomplete, state what's
+missing and provide the best possible guidance strictly grounded in the sources.
+Do NOT hallucinate or introduce facts not present in the sources.
+If there are no relevant sources, reply exactly:
+"I was not able to find any solution from our knowledge base right now. You can try rephrasing or escalate."
+"""
+
+USER_PROMPT_TEMPLATE = """\
+Question:
+{question}
+
+Sources:
+{context}
+
+Instructions:
+- Use the sources to answer. If the source contains explicit steps, list them as bullets and add the source tag(s) after each bullet (e.g. [S1]).
+- If the sources only partially answer, say what is missing and provide the best guidance you can, citing the sources used.
+- If you cannot find any relevant information, reply exactly with:
+"I was not able to find any solution from our knowledge base right now. You can try rephrasing or escalate."
+- Keep answers concise and practical (4-8 bullets if applicable).
+"""
+
+'''
+@app.post("/searchquery")
+async def searchquery(payload: Dict[str, Any]):
+    """
+    Body: { "q": "...", "k": 6, "min_score": 0.25 }
+    Returns: { "answer": "...", "citations": [...], "used_k": n }
+    """
+    print("OPENAI_API_KEY =", os.getenv("OPENAI_API_KEY"))
+    print("USE_OPENAI =", USE_OPENAI)
+    
+    q = (payload.get("q") or "").strip()
+    k = int(payload.get("k") or 6)
+    min_score = float(payload.get("min_score") or 0.25)
+
+    if not q:
+        return JSONResponse({"success": False, "message": "Missing 'q'."}, status_code=400)
+
+    hits = retrieve(q, k=k)
+    citations = build_citations(hits, min_score=min_score)
+
+    # Graceful fallback if nothing good enough
+    if not citations:
+        graceful = "I was not able to find any solution from our knowledge base right now. You can try rephrasing or escalate."
+        return JSONResponse({
+            "success": True,
+            "answer": graceful,
+            "citations": [],
+            "used_k": 0
+        })
+
+    context = build_llm_context(citations)
+    print("LLM context:\n", context)
+    user_prompt = USER_PROMPT_TEMPLATE.format(question=q, context=context)
+    print("User prompt:\n", user_prompt)
+
+    # Synthesize with LLM if available; otherwise return extractive summary with citations only.
+    if USE_OPENAI:
+        completion = openai_client.chat.completions.create(
+            model=LLM_MODEL,
+            temperature=0.1,
+            messages=[
+                {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                {"role": "user", "content": user_prompt},
+            ]
+        )
+        print("LLM raw response:", completion)
+        answer = completion.choices[0].message.content.strip()
+        print("LLM answer:", answer)
+    else:
+        # Zero-LLM fallback: stitch the most relevant previews with source tags.
+        parts = [f"- {c['preview']} [S{c['rank']}]" for c in citations[:3] if c.get("preview")]
+        answer = "\n".join(parts) if parts else \
+            "I was not able to find any solution from our knowledge base right now. You can try rephrasing or escalate."
+
+    return JSONResponse({
+        "success": True,
+        "answer": answer,
+        "citations": citations,
+        "used_k": len(citations),
+    })
+
+'''
+
+@app.post("/searchquery")
+async def searchquery(payload: Dict[str, Any]):
+    q = (payload.get("q") or "").strip()
+    k = int(payload.get("k") or 6)
+    min_score = float(payload.get("min_score") or 0.25)
+
+    if not q:
+        return JSONResponse({"success": False, "message": "Missing 'q'."}, status_code=400)
+
+    hits = retrieve(q, k=k)
+    citations = build_citations(hits, min_score=min_score)
+
+    if not citations:
+        return JSONResponse({
+            "success": True,
+            "answer": "I was not able to find any solution from our knowledge base right now. You can try rephrasing or escalate.",
+            "citations": [],
+            "used_k": 0
+        })
+
+    # dedupe and build context (full content)
+    citations = dedupe_citations(citations)
+    context = build_llm_context(citations, max_sources=min(len(citations), 6))
+    user_prompt = USER_PROMPT_TEMPLATE.format(question=q, context=context)
+
+    # Try LLM (if configured), with robust fallback to extractive
+    fallback_text = "I was not able to find any solution from our knowledge base right now. You can try rephrasing or escalate."
+    answer = None
+
+    if USE_OPENAI:
+        try:
+            print("LLM context:\n", context)  # debug
+            print("User prompt:\n", user_prompt[:2000])  # avoid extremely long logs
+            completion = openai_client.chat.completions.create(
+                model=LLM_MODEL,
+                temperature=0.0,
+                messages=[
+                    {"role": "system", "content": SYSTEM_INSTRUCTIONS},
+                    {"role": "user", "content": user_prompt},
+                ],
+                max_tokens=512,
+            )
+            # Extract assistant text safely
+            answer = completion.choices[0].message.content.strip() if completion.choices else None
+            # If model returned exact refusal or empty, treat as failure
+            if not answer or answer.strip() == fallback_text:
+                answer = None
+        except Exception as e:
+            print("LLM call failed, falling back to extractive. Error:", e)
+            answer = None
+
+    # If no LLM answer, build an extractive, cited reply from top chunks
+    if not answer:
+        parts = []
+        for i, c in enumerate(citations[:3], start=1):
+            text = (c.get("content") or c.get("chunk") or c.get("preview") or "").strip()
+            if text:
+                parts.append(f"[S{i}] {text}")
+        answer = "\n\n".join(parts) if parts else fallback_text
+
+    return JSONResponse({
+        "success": True,
+        "answer": answer,
+        "citations": citations,
+        "used_k": len(citations),
+    })

@@ -125,6 +125,12 @@ Enjoy!
 
 - uvicorn sn_mcp_client.api_server:app --reload --port 8000
 
+### Run with openAI key
+
+- set OPENAI_API_KEY=<your_open_api_key>
+
+- uvicorn sn_mcp_client.api_server:app --reload --port 8000 
+
 ### Use 
 
 - http://127.0.0.1:8000/tools
