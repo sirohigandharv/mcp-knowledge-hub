@@ -103,8 +103,8 @@ import faiss, os, pickle
 from typing import List, Dict, Any, Optional
 
 EMBED_MODEL_NAME = os.getenv("EMBED_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
-embedding_model = SentenceTransformer(EMBED_MODEL_NAME)
-EMBED_DIM = embedding_model.get_sentence_embedding_dimension()
+embedding_model_rag = SentenceTransformer(EMBED_MODEL_NAME)
+EMBED_DIM = embedding_model_rag.get_sentence_embedding_dimension()
 
 # ---- FAISS + metadata paths ----
 INDEX_PATH_NEW = os.path.join(UPLOAD_DIR, "kb.index")
@@ -128,15 +128,15 @@ if STORAGE_MODE == "cloud":
 
 # ---- FAISS index initialization ----
 index: Optional[faiss.Index] = None
-metadata_store: List[Dict[str, Any]] = []
+metadata_store_new: List[Dict[str, Any]] = []
 
 def load_or_init_index():
     """Load existing FAISS + metadata or create a new one."""
-    global index, metadata_store
+    global index, metadata_store_new
     if os.path.exists(INDEX_PATH_NEW) and os.path.exists(META_PATH_NEW):
         index = faiss.read_index(INDEX_PATH_NEW)
         with open(META_PATH_NEW, "rb") as f:
-            metadata_store[:] = pickle.load(f)
+            metadata_store_new[:] = pickle.load(f)
     else:
         index = faiss.IndexFlatIP(EMBED_DIM)  # cosine similarity via inner product
 
@@ -144,7 +144,7 @@ def persist_index():
     """Persist FAISS + metadata locally and upload to GCP if in cloud mode."""
     faiss.write_index(index, INDEX_PATH_NEW)
     with open(META_PATH_NEW, "wb") as f:
-        pickle.dump(metadata_store, f)
+        pickle.dump(metadata_store_new, f)
 
     if STORAGE_MODE == "cloud":
         bucket.blob(INDEX_BLOB_NEW).upload_from_filename(INDEX_PATH_NEW)
@@ -608,8 +608,14 @@ async def upload_files_from_downloads():
             new_metadata.append({"filename": os.path.basename(filename), "chunk": chunk})
 
     if new_metadata:
-        # Add to FAISS in one go
+        # Add consistency check **before** adding to FAISS
         concat_embeddings = np.concatenate(all_embeddings, axis=0)
+        if concat_embeddings.shape[0] != len(new_metadata):
+            print(f"Mismatch: embeddings={concat_embeddings.shape[0]} metadata={len(new_metadata)}")
+            return JSONResponse(content={
+                "success": False,
+                "message": "Aborting upload: mismatch between embeddings and metadata"
+            })
         faiss_index.add(concat_embeddings)
         metadata_store.extend(new_metadata)
 
@@ -623,7 +629,7 @@ async def upload_files_from_downloads():
             bucket.blob(INDEX_BLOB).upload_from_filename(INDEX_PATH)
             bucket.blob(METADATA_BLOB).upload_from_filename(METADATA_PATH)
 
-
+    print("FAISS total:", faiss_index.ntotal, "Metadata length:", len(metadata_store))
     return JSONResponse(content={
         "success": True,
         "message": f"Processed and indexed {len(stored_files)} PDF(s).",
@@ -635,6 +641,7 @@ async def upload_files_from_downloads():
 @app.get("/search")
 async def search(query: str = Query(..., description="Search query"),
                  top_k: int = Query(5, description="Number of top results to return")):
+    print("FAISS total:", faiss_index.ntotal, "Metadata length:", len(metadata_store))
     if faiss_index.ntotal == 0:
         return JSONResponse(content={
             "success": False,
@@ -826,7 +833,7 @@ def embed_texts(texts: List[str], batch_size: int = 64) -> np.ndarray:
     vecs = []
     for i in range(0, len(texts), batch_size):
         batch = texts[i:i+batch_size]
-        e = embedding_model.encode(batch, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+        e = embedding_model_rag.encode(batch, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
         vecs.append(e)
     return np.vstack(vecs) if vecs else np.zeros((0, EMBED_DIM), dtype="float32")
 
@@ -912,7 +919,7 @@ async def ingest_all(concurrency: int = Query(4, ge=1, le=64)):
     added = 0
     if vecs.shape[0] > 0:
         index.add(vecs)
-        metadata_store.extend(new_chunk_meta)
+        metadata_store_new.extend(new_chunk_meta)
         persist_index()
         added = vecs.shape[0]
 
@@ -944,7 +951,7 @@ def build_citations(hits: List[Tuple[int, float]], min_score: float = 0.25) -> L
     for i, score in hits:
         if score < min_score:
             continue
-        m = metadata_store[i]
+        m = metadata_store_new[i]
         cites.append({
             "rank": len(cites) + 1,
             "score": score,

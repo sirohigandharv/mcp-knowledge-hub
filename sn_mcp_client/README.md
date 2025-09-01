@@ -125,6 +125,11 @@ Enjoy!
 
 - uvicorn sn_mcp_client.api_server:app --reload --port 8000
 
+### With OpenAI
+
+- set OPENAI_API_KEY=<your open api key>
+- uvicorn sn_mcp_client.api_server:app --reload --port 8000
+
 ### Run with openAI key
 
 - set OPENAI_API_KEY=<your_open_api_key>
