@@ -8,3 +8,4 @@ sentence-transformers
 PyPDF2
 google-cloud-storage
 nltk
+openai
